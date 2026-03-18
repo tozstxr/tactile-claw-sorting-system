@@ -1,0 +1,116 @@
+#include <Arduino.h>
+#include <Servo.h>
+
+const int SERVO_PIN = 9;
+const int FSR_PIN = A0;
+
+// Servo limits
+
+const int OPEN_US = 1355;
+const int CLOSE_US = 1860;
+
+// Motor Steps
+
+const int STEP_US = 5;
+const int STEP_DELAY_MS = 15;
+
+// FSR tuning 
+
+const int FSR_STOP = 700; // stop closing when avg >= this
+const int FSR_AVG_N = 10; // averaging samples
+const unsigned long F_PERIOD_MS = 200; // FSR stream rate (5 Hz)
+
+// State 
+
+Servo claw;
+int posUs = (OPEN_US + CLOSE_US) / 2;
+String line;
+unsigned long lastFms = 0;
+
+int read_fsr_avg(int n = FSR_AVG_N) {
+long sum = 0;
+for (int i = 0; i < n; i++) {
+ sum += analogRead(FSR_PIN);
+ delay(2);
+}
+return (int)(sum / n);
+}
+
+void writeUs(int us) {
+posUs = constrain(us, OPEN_US, CLOSE_US);
+claw.writeMicroseconds(posUs);
+}
+
+void moveTo(int targetUs) {
+targetUs = constrain(targetUs, OPEN_US, CLOSE_US);
+while (posUs != targetUs) {
+ if (posUs < targetUs) posUs = min(posUs + STEP_US, targetUs);
+ else posUs = max(posUs - STEP_US, targetUs);
+ claw.writeMicroseconds(posUs);
+ delay(STEP_DELAY_MS);
+}
+}
+
+void openClaw() {
+Serial.println("CLAW_OPENING");
+moveTo(OPEN_US);
+Serial.println("CLAW_OPENED");
+}
+
+void closeUntilForce() {
+Serial.println("CLAW_CLOSING");
+while (posUs < CLOSE_US) {
+ int fsr = read_fsr_avg();
+ if (fsr >= FSR_STOP) {
+ Serial.println("CLAW_CLOSED");
+ return;
+ }
+ posUs = min(posUs + STEP_US, CLOSE_US);
+ claw.writeMicroseconds(posUs);
+ delay(STEP_DELAY_MS);
+}
+Serial.println("CLAW_CLOSED");
+}
+
+void streamFsr() {
+if (millis() - lastFms >= F_PERIOD_MS) {
+ int fsr = read_fsr_avg();
+ Serial.print("F=");
+ Serial.println(fsr);
+ lastFms = millis();
+}
+}
+
+void setup() {
+Serial.begin(115200);
+delay(250);
+claw.attach(SERVO_PIN);
+writeUs((OPEN_US + CLOSE_US) / 2);
+pinMode(FSR_PIN, INPUT);
+Serial.println("READY_CLAW_SERVO_FSR");
+Serial.println("INFO cmds: OPEN | CLOSE | F? | POS?");
+}
+
+void loop() {
+streamFsr();
+  
+if (!Serial.available()) return;
+  
+line = Serial.readStringUntil('\n');
+line.trim();
+if (!line.length()) return;
+if (line == "OPEN") { openClaw(); return; }
+if (line == "CLOSE") { closeUntilForce(); return; }
+if (line == "F?") {
+ int fsr = read_fsr_avg();
+ Serial.print("F=");
+ Serial.println(fsr);
+ return;
+}
+if (line == "POS?") {
+ Serial.print("Servo_us=");
+ Serial.println(posUs);
+ return;
+}
+Serial.println("ERR UNKNOWN");
+}
