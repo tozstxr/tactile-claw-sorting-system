@@ -1,0 +1,940 @@
+#!/usr/bin/env python3
+import time, json, threading, os
+from collections import deque
+
+import serial
+import ttkbootstrap as tb
+from ttkbootstrap.constants import *
+
+import cv2
+import numpy as np
+from PIL import Image, ImageTk
+
+
+# Fixed ports
+
+GANTRY_PORT = "/dev/ttyACM0"  #  gantry = asm1
+CLAW_PORT   = "/dev/ttyACM1"  #  claw   = asm0
+BAUD = 115200
+
+TARGET_FILE = "/tmp/latest_target.json"
+TARGET_STALE_SEC = 1.0
+CALIB_FILE = "floor_calib.json"
+
+CAM_DEVICE = 0
+CAM_W, CAM_H = 360, 240
+CAM_FPS_DELAY_MS = 33
+
+HOLD_STEP_X = 0.25
+HOLD_STEP_Y = 0.25
+REPEAT_MS = 25
+
+LIGHT_BIN  = (0.00, 20.00)
+MED_BIN    = (21.65, 20.00)
+HEAVY_BIN  = (38.00, 20.00)
+
+FSR_STOP = 900
+CLOSE_TIMEOUT = 60.0
+POST_ZBOTTOM_SETTLE = 0.25
+MOVE_TIMEOUT = 60.0
+Z_TIMEOUT = 80.0
+
+SPHERE_MIN_BLOB_AREA = 40
+BLUE_LO  = np.array([85,  15,  15])
+BLUE_HI  = np.array([145, 255, 255])
+GREEN_LO = np.array([35,  15,  15])
+GREEN_HI = np.array([85, 255, 255])
+STICKY_SEC = 0.80
+EMA_ALPHA = 0.35
+
+ser_gantry = None
+ser_claw   = None
+
+io_lock = threading.Lock()
+
+latest_weight = None
+latest_fsr = None
+
+weight_frozen = False
+frozen_weight = None
+
+busy_lock = threading.Lock()
+busy = False
+
+gantry_q = deque(maxlen=4000)
+claw_q   = deque(maxlen=4000)
+gantry_q_lock = threading.Lock()
+claw_q_lock   = threading.Lock()
+
+hold_active = False
+hold_dx = 0.0
+hold_dy = 0.0
+hold_after_id = None
+
+vision_lock = threading.Lock()
+vision_bgr = None
+vision_err = None
+vision_status = "Vision: starting..."
+stop_vision = threading.Event()
+
+gantry_homed_lock = threading.Lock()
+gantry_homed = False
+
+
+# Helpers
+
+
+def set_busy(v: bool):
+    global busy
+    with busy_lock:
+        busy = v
+
+def is_busy():
+    with busy_lock:
+        return busy
+
+def set_homed(v: bool):
+    global gantry_homed
+    with gantry_homed_lock:
+        gantry_homed = v
+
+def is_homed():
+    with gantry_homed_lock:
+        return gantry_homed
+
+def safe_readline(ser):
+    try:
+        b = ser.readline()
+        if not b:
+            return None
+        s = b.decode(errors="ignore").strip()
+        return s if s else None
+    except:
+        return None
+
+def send_line(ser, cmd: str):
+    if ser is None:
+        return
+    with io_lock:
+        ser.write((cmd + "\n").encode("utf-8"))
+        try:
+            ser.flush()
+        except:
+            pass
+
+def q_push(q, qlock, line: str):
+    with qlock:
+        q.append(line)
+
+def clear_queue(q, qlock):
+    with qlock:
+        q.clear()
+
+def q_pop_match(q, qlock, predicate):
+    with qlock:
+        for i, ln in enumerate(q):
+            if predicate(ln):
+                newq = deque(maxlen=q.maxlen)
+                for j, x in enumerate(q):
+                    if j != i:
+                        newq.append(x)
+                q.clear()
+                q.extend(newq)
+                return ln
+    return None
+
+def wait_for_queue(q, qlock, predicate, timeout=15.0):
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        ln = q_pop_match(q, qlock, predicate)
+        if ln is not None:
+            return ln
+        time.sleep(0.01)
+    raise TimeoutError("Timeout waiting for expected message")
+
+def send_and_wait(ser, q, qlock, cmd, predicate, timeout=30.0):
+    clear_queue(q, qlock)
+    send_line(ser, cmd)
+    return wait_for_queue(q, qlock, predicate, timeout=timeout)
+
+def log(msg: str):
+    status_var.set(f"Status: {msg}")
+    log_box.configure(state="normal")
+    log_box.insert("end", msg + "\n")
+    log_box.see("end")
+    log_box.configure(state="disabled")
+
+def set_weight_display(w):
+    weight_var.set("-- g" if w is None else f"{w:.2f} g")
+
+def set_fsr_display(f):
+    fsr_var.set("--" if f is None else str(int(f)))
+
+def set_category_display(cat):
+    category_var.set(cat)
+
+def choose_bin_and_coords(weight_g: float):
+    if weight_g < 50.0:
+        return "LIGHT", LIGHT_BIN
+    elif weight_g < 200.0:
+        return "MEDIUM", MED_BIN
+    else:
+        return "HEAVY", HEAVY_BIN
+
+def choose_bin_name(weight_g: float):
+    if weight_g < 50.0:
+        return "LIGHT"
+    elif weight_g < 200.0:
+        return "MEDIUM"
+    else:
+        return "HEAVY"
+
+
+# Connect serial (fixed ports)
+
+def connect_serial():
+    global ser_gantry, ser_claw
+    set_homed(False)
+
+    try:
+        ser_gantry = serial.Serial(GANTRY_PORT, BAUD, timeout=0.02)
+        time.sleep(2.0)
+        ser_gantry.reset_input_buffer()
+        log(f"Connected GANTRY: {GANTRY_PORT}")
+    except Exception as e:
+        ser_gantry = None
+        log(f"Gantry connect failed: {e}")
+
+    try:
+        ser_claw = serial.Serial(CLAW_PORT, BAUD, timeout=0.02)
+        time.sleep(2.0)
+        ser_claw.reset_input_buffer()
+        log(f"Connected CLAW: {CLAW_PORT}")
+    except Exception as e:
+        ser_claw = None
+        log(f"Claw connect failed: {e}")
+
+def serial_reader_loop():
+    global latest_weight, latest_fsr
+    while True:
+        if ser_gantry:
+            ln = safe_readline(ser_gantry)
+            if ln:
+                if ln.startswith("W="):
+                    try:
+                        latest_weight = float(ln.split("=", 1)[1])
+                    except:
+                        pass
+                if ln == "HOMED":
+                    set_homed(True)
+                if "ERR NOT_HOMED" in ln:
+                    set_homed(False)
+                q_push(gantry_q, gantry_q_lock, ln)
+
+        if ser_claw:
+            ln = safe_readline(ser_claw)
+            if ln:
+                if ln.startswith("F="):
+                    try:
+                        latest_fsr = int(float(ln.split("=", 1)[1]))
+                    except:
+                        pass
+                elif ln.isdigit():
+                    try:
+                        latest_fsr = int(ln)
+                    except:
+                        pass
+                q_push(claw_q, claw_q_lock, ln)
+
+        time.sleep(0.005)
+
+
+# Weight snapshot
+
+
+def snapshot_weight():
+    global weight_frozen, frozen_weight
+    if latest_weight is None:
+        return None
+    frozen_weight = float(latest_weight)
+    weight_frozen = True
+    return frozen_weight
+
+def unfreeze_weight():
+    global weight_frozen, frozen_weight
+    weight_frozen = False
+    frozen_weight = None
+    set_category_display("—")
+    log("Weight unfrozen (live again)")
+
+def read_latest_target():
+    try:
+        with open(TARGET_FILE, "r") as f:
+            d = json.load(f)
+        age = time.time() - float(d.get("t", 0))
+        if age > TARGET_STALE_SEC:
+            return None
+        return float(d["x"]), float(d["y"])
+    except:
+        return None
+
+
+# Claw close wait
+
+
+def wait_for_claw_closed(timeout=CLOSE_TIMEOUT):
+    t0 = time.time()
+    last_seen = None
+    while time.time() - t0 < timeout:
+        ln = q_pop_match(claw_q, claw_q_lock, lambda s: s == "CLAW_CLOSED")
+        if ln:
+            return "CLAW_CLOSED"
+        if latest_fsr is not None:
+            last_seen = latest_fsr
+            if latest_fsr >= FSR_STOP:
+                return f"FSR_REACHED_{latest_fsr}"
+        time.sleep(0.01)
+    raise TimeoutError(f"Timeout waiting for claw close (last FSR={last_seen})")
+
+
+# Homing helper
+
+
+def ensure_homed_async(then_callback=None):
+    if not ser_gantry:
+        log("Gantry not connected")
+        return
+    if is_homed():
+        if then_callback:
+            root.after(0, then_callback)
+        return
+    if is_busy():
+        return
+
+    def worker():
+        set_busy(True)
+        try:
+            log("Auto-homing...")
+            send_and_wait(ser_gantry, gantry_q, gantry_q_lock,
+                          "HOME", lambda s: s == "HOMED",
+                          timeout=MOVE_TIMEOUT)
+            set_homed(True)
+            log("Homed — ready")
+            if then_callback:
+                root.after(0, then_callback)
+        except Exception as e:
+            log(f"Auto-home failed: {e}")
+        finally:
+            set_busy(False)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+# Manual XY hold-to-move
+
+
+def _hold_tick():
+    global hold_after_id
+    if not hold_active:
+        hold_after_id = None
+        return
+    if is_busy():
+        hold_after_id = root.after(REPEAT_MS, _hold_tick)
+        return
+    if not ser_gantry:
+        hold_after_id = None
+        return
+    if not is_homed():
+        stop_hold()
+        return
+
+    send_line(ser_gantry, f"MOVE {hold_dx:.2f} {hold_dy:.2f}")
+    hold_after_id = root.after(REPEAT_MS, _hold_tick)
+
+def start_hold(dx, dy):
+    global hold_active, hold_dx, hold_dy, hold_after_id
+    if not ser_gantry:
+        log("Gantry not connected")
+        return
+    if not is_homed():
+        ensure_homed_async(then_callback=lambda: start_hold(dx, dy))
+        return
+
+    hold_active = True
+    hold_dx, hold_dy = dx, dy
+    if hold_after_id is None:
+        _hold_tick()
+
+def stop_hold():
+    global hold_active, hold_after_id
+    hold_active = False
+    if hold_after_id is not None:
+        try:
+            root.after_cancel(hold_after_id)
+        except:
+            pass
+        hold_after_id = None
+
+
+#  Manual retract buttons (use ZUP_HOLD)
+
+
+def manual_retract_hold():
+    stop_hold()
+    if not ser_gantry:
+        log("Gantry not connected")
+        return
+    send_line(ser_gantry, "ZUP_HOLD")
+    log("Manual: RETRACT HOLD (ZUP_HOLD)")
+
+def manual_stop_retract():
+    stop_hold()
+    if not ser_gantry:
+        log("Gantry not connected")
+        return
+    send_line(ser_gantry, "ZSTOP")
+    log("Manual: STOP RETRACT (ZSTOP)")
+
+
+# Manual actions
+
+
+def manual_home():
+    if is_busy():
+        log("Busy — wait")
+        return
+    if not ser_gantry:
+        log("Gantry not connected")
+        return
+    stop_hold()
+
+    def worker():
+        set_busy(True)
+        try:
+            log("Manual: HOME")
+            send_and_wait(ser_gantry, gantry_q, gantry_q_lock,
+                          "HOME", lambda s: s == "HOMED",
+                          timeout=MOVE_TIMEOUT)
+            set_homed(True)
+            log("Manual: HOMED")
+        except Exception as e:
+            log(f"Manual HOME failed: {e}")
+        finally:
+            set_busy(False)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+def manual_drop_pick():
+    if is_busy():
+        log("Busy — wait")
+        return
+    if not (ser_gantry and ser_claw):
+        log("Missing gantry/claw connection")
+        return
+    stop_hold()
+
+    if not is_homed():
+        ensure_homed_async(then_callback=manual_drop_pick)
+        return
+
+    def worker():
+        set_busy(True)
+        try:
+            log("Manual: ZBOTTOM")
+            send_and_wait(ser_gantry, gantry_q, gantry_q_lock,
+                          "ZBOTTOM", lambda s: s == "Z_AT_BOTTOM",
+                          timeout=Z_TIMEOUT)
+
+            time.sleep(POST_ZBOTTOM_SETTLE)
+
+            log("Manual: CLOSE (FSR)")
+            clear_queue(claw_q, claw_q_lock)
+            send_line(ser_claw, "CLOSE")
+            result = wait_for_claw_closed(timeout=CLOSE_TIMEOUT)
+            log(f"Manual: CLAW CLOSED ({result})")
+
+            log("Manual: ZTOP")
+            send_and_wait(ser_gantry, gantry_q, gantry_q_lock,
+                          "ZTOP", lambda s: "Z_AT_TOP" in s,
+                          timeout=Z_TIMEOUT)
+
+            log("Manual: done")
+        except Exception as e:
+            log(f"Manual failed: {e}")
+        finally:
+            set_busy(False)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+def manual_release_open():
+    if is_busy():
+        log("Busy — wait")
+        return
+    if not ser_claw:
+        log("Claw not connected")
+        return
+
+    def worker():
+        set_busy(True)
+        try:
+            log("Manual: OPEN")
+            send_and_wait(ser_claw, claw_q, claw_q_lock,
+                          "OPEN", lambda s: s == "CLAW_OPENED",
+                          timeout=25.0)
+            log("Manual: released")
+        except Exception as e:
+            log(f"Release failed: {e}")
+        finally:
+            set_busy(False)
+
+    threading.Thread(target=worker, daemon=True).start()
+
+
+# Auto cycle
+
+
+def start_auto_cycle():
+    if is_busy():
+        log("Busy — wait")
+        return
+    if not (ser_gantry and ser_claw):
+        log("Missing gantry/claw connection")
+        return
+    stop_hold()
+
+    tgt = read_latest_target()
+    if tgt is None:
+        log("No stable target (vision not locked)")
+        return
+
+    w = snapshot_weight()
+    if w is None:
+        log("No weight to snapshot")
+        return
+
+    cat, (bx, by) = choose_bin_and_coords(w)
+    set_category_display(cat)
+
+    pick_x, pick_y = tgt
+    log(f"AUTO snapshot: {w:.2f} g -> {cat}")
+
+    def worker():
+        set_busy(True)
+        try:
+            log("AUTO: HOME")
+            send_and_wait(ser_gantry, gantry_q, gantry_q_lock,
+                          "HOME", lambda s: s == "HOMED",
+                          timeout=MOVE_TIMEOUT)
+            set_homed(True)
+
+            log("AUTO: GOTO target")
+            send_and_wait(ser_gantry, gantry_q, gantry_q_lock,
+                          f"GOTOABS {pick_x:.2f} {pick_y:.2f}",
+                          lambda s: s == "AT",
+                          timeout=MOVE_TIMEOUT)
+
+            log("AUTO: ZBOTTOM")
+            send_and_wait(ser_gantry, gantry_q, gantry_q_lock,
+                          "ZBOTTOM", lambda s: s == "Z_AT_BOTTOM",
+                          timeout=Z_TIMEOUT)
+
+            time.sleep(POST_ZBOTTOM_SETTLE)
+
+            log("AUTO: CLOSE (FSR)")
+            clear_queue(claw_q, claw_q_lock)
+            send_line(ser_claw, "CLOSE")
+            result = wait_for_claw_closed(timeout=CLOSE_TIMEOUT)
+            log(f"AUTO: CLAW CLOSED ({result})")
+
+            log("AUTO: ZTOP")
+            send_and_wait(ser_gantry, gantry_q, gantry_q_lock,
+                          "ZTOP", lambda s: "Z_AT_TOP" in s,
+                          timeout=Z_TIMEOUT)
+
+            log("AUTO: GOTO bin")
+            send_and_wait(ser_gantry, gantry_q, gantry_q_lock,
+                          f"GOTOABS {bx:.2f} {by:.2f}",
+                          lambda s: s == "AT",
+                          timeout=MOVE_TIMEOUT)
+
+            log("AUTO: OPEN")
+            send_and_wait(ser_claw, claw_q, claw_q_lock,
+                          "OPEN", lambda s: s == "CLAW_OPENED",
+                          timeout=25.0)
+
+            log("AUTO: HOME")
+            send_and_wait(ser_gantry, gantry_q, gantry_q_lock,
+                          "HOME", lambda s: s == "HOMED",
+                          timeout=MOVE_TIMEOUT)
+            set_homed(True)
+
+            log("AUTO: DONE")
+
+        except Exception as e:
+            log(f"AUTO failed: {e}")
+        finally:
+            set_busy(False)
+            unfreeze_weight()
+
+    threading.Thread(target=worker, daemon=True).start()
+
+# UI update
+
+
+def ui_tick():
+    if weight_frozen:
+        set_weight_display(frozen_weight)
+        if frozen_weight is not None:
+            set_category_display(choose_bin_name(frozen_weight))
+    else:
+        set_weight_display(latest_weight)
+
+    set_fsr_display(latest_fsr)
+    root.after(100, ui_tick)
+
+
+# Screen navigation
+
+
+def show_screen(name: str):
+    for f in (screen_home, screen_manual, screen_auto):
+        f.pack_forget()
+
+    if name == "home":
+        screen_home.pack(fill="both", expand=True)
+        log("Select mode: Manual or Automatic")
+    elif name == "manual":
+        screen_manual.pack(fill="both", expand=True)
+        log("Manual mode ready")
+        if ser_gantry and (not is_homed()) and (not is_busy()):
+            ensure_homed_async()
+    elif name == "auto":
+        screen_auto.pack(fill="both", expand=True)
+        log("Automatic mode ready")
+
+
+# Vision (same as your sphere-only pipeline)
+
+def _load_calib():
+    with open(CALIB_FILE, "r") as f:
+        calib = json.load(f)
+
+    src_pix = calib["src_pixels_tl_tr_br_bl"]
+    H = np.array(calib["H_pixel_to_floor_in"], dtype=np.float32)
+    cam_w = int(calib.get("cam_w", 640))
+    cam_h = int(calib.get("cam_h", 480))
+
+    floor_poly_draw = np.array(src_pix, dtype=np.int32).reshape((-1, 1, 2))
+    floor_poly_pts  = np.array(src_pix, dtype=np.int32).reshape((-1, 2))
+
+    FLOOR_W_IN = 16.0
+    FLOOR_H_IN = 11.5
+    X_MAX_UNITS = 41.0
+    Y_MAX_UNITS = 20.0
+
+    UX = X_MAX_UNITS / FLOOR_W_IN
+    UY = Y_MAX_UNITS / FLOOR_H_IN
+
+    def clamp(v, lo, hi):
+        return max(lo, min(hi, v))
+
+    def pixel_to_floor_in(cx, cy):
+        p = np.array([[[cx, cy]]], dtype=np.float32)
+        q = cv2.perspectiveTransform(p, H)
+        return float(q[0, 0, 0]), float(q[0, 0, 1])
+
+    def inside_floor(x_in, y_in):
+        return (0.0 <= x_in <= FLOOR_W_IN) and (0.0 <= y_in <= FLOOR_H_IN)
+
+    def floor_in_to_abs_units(x_in, y_in):
+        return clamp(x_in * UX, 0.0, X_MAX_UNITS), clamp(y_in * UY, 0.0, Y_MAX_UNITS)
+
+    return cam_w, cam_h, floor_poly_draw, floor_poly_pts, pixel_to_floor_in, inside_floor, floor_in_to_abs_units
+
+def find_sphere_bbox(frame_bgr, floor_poly_pts, pixel_to_floor_in, inside_floor):
+    hsv = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)
+    h, s, v = cv2.split(hsv)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    v = clahe.apply(v)
+    hsv = cv2.merge([h, s, v])
+
+    mask_blue  = cv2.inRange(hsv, BLUE_LO, BLUE_HI)
+    mask_green = cv2.inRange(hsv, GREEN_LO, GREEN_HI)
+    mask = cv2.bitwise_or(mask_blue, mask_green)
+
+    floor_mask = np.zeros(mask.shape, dtype=np.uint8)
+    cv2.fillPoly(floor_mask, [floor_poly_pts.astype(np.int32)], 255)
+    mask = cv2.bitwise_and(mask, floor_mask)
+
+    mask = cv2.medianBlur(mask, 5)
+    kernel = np.ones((5, 5), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return None
+
+    best, best_score = None, -1
+    for c in contours:
+        area = cv2.contourArea(c)
+        if area < SPHERE_MIN_BLOB_AREA:
+            continue
+        x, y, w, h = cv2.boundingRect(c)
+        cx = x + w // 2
+        cy = y + h // 2
+        x_in, y_in = pixel_to_floor_in(cx, cy)
+        if not inside_floor(x_in, y_in):
+            continue
+        peri = cv2.arcLength(c, True)
+        if peri <= 1:
+            continue
+        circularity = 4.0 * np.pi * area / (peri * peri)
+        score = area * (0.6 + circularity)
+        if score > best_score:
+            best_score = score
+            best = (x, y, x + w, y + h, cx, cy)
+    return best
+
+def export_target(xu, yu):
+    try:
+        with open(TARGET_FILE, "w") as f:
+            json.dump({"x": float(xu), "y": float(yu), "t": time.time()}, f)
+    except:
+        pass
+
+def vision_worker():
+    global vision_bgr, vision_err, vision_status
+    try:
+        if not os.path.exists(CALIB_FILE):
+            raise FileNotFoundError(f"Missing {CALIB_FILE} (place next to this .py file).")
+
+        cam_w, cam_h, floor_poly_draw, floor_poly_pts, pixel_to_floor_in, inside_floor, floor_in_to_abs_units = _load_calib()
+
+        cap = cv2.VideoCapture(CAM_DEVICE, cv2.CAP_V4L2)
+        cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, cam_w)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cam_h)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        if not cap.isOpened():
+            raise RuntimeError(f"Could not open camera CAM_DEVICE={CAM_DEVICE}")
+
+        vision_status = "Vision: OK (sphere)"
+
+        last_good, last_good_t = None, 0.0
+        smooth_cx = smooth_cy = None
+
+        while not stop_vision.is_set():
+            cap.grab(); cap.grab()
+            ret, frame = cap.read()
+            if not ret or frame is None:
+                continue
+
+            frame = cv2.resize(frame, (cam_w, cam_h))
+            cv2.polylines(frame, [floor_poly_draw], True, (0, 255, 0), 2)
+
+            sphere = find_sphere_bbox(frame, floor_poly_pts, pixel_to_floor_in, inside_floor)
+
+            chosen = None
+            if sphere is not None:
+                x1, y1, x2, y2, cx, cy = sphere
+                chosen = {"x1": x1, "y1": y1, "x2": x2, "y2": y2, "cx": cx, "cy": cy}
+
+            now = time.time()
+            if chosen is not None:
+                last_good = chosen
+                last_good_t = now
+
+            if (last_good is not None) and ((now - last_good_t) <= STICKY_SEC):
+                x1, y1, x2, y2 = last_good["x1"], last_good["y1"], last_good["x2"], last_good["y2"]
+                cx, cy = last_good["cx"], last_good["cy"]
+
+                if smooth_cx is None:
+                    smooth_cx, smooth_cy = float(cx), float(cy)
+                else:
+                    smooth_cx = (1 - EMA_ALPHA) * smooth_cx + EMA_ALPHA * float(cx)
+                    smooth_cy = (1 - EMA_ALPHA) * smooth_cy + EMA_ALPHA * float(cy)
+
+                scx, scy = int(smooth_cx), int(smooth_cy)
+
+                x_in, y_in = pixel_to_floor_in(scx, scy)
+                xu, yu = floor_in_to_abs_units(x_in, y_in)
+                export_target(xu, yu)
+
+                cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 255), 3)
+                cv2.circle(frame, (scx, scy), 4, (0, 255, 255), -1)
+
+            disp = cv2.resize(frame, (CAM_W, CAM_H))
+            with vision_lock:
+                vision_bgr = disp
+
+        cap.release()
+
+    except Exception as e:
+        vision_err = str(e)
+        vision_status = "Vision: ERROR"
+
+def update_camera_widget():
+    if vision_err:
+        cam_status_var.set(f"Vision error: {vision_err}")
+        root.after(1000, update_camera_widget)
+        return
+
+    cam_status_var.set(vision_status)
+
+    with vision_lock:
+        frame = None if vision_bgr is None else vision_bgr.copy()
+
+    if frame is not None:
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(rgb)
+        imgtk = ImageTk.PhotoImage(image=img)
+        cam_label.imgtk = imgtk
+        cam_label.configure(image=imgtk)
+
+    root.after(CAM_FPS_DELAY_MS, update_camera_widget)
+
+
+# GUI BUILD
+
+
+root = tb.Window(themename="flatly")
+root.title("Tactile Claw")
+root.geometry("980x860")
+
+header = tb.Frame(root)
+header.pack(fill="x", padx=12, pady=10)
+header.columnconfigure(0, weight=1)
+
+title_block = tb.Frame(header)
+title_block.grid(row=0, column=0, sticky="w")
+tb.Label(title_block, text="Tactile Claw", font=("Arial", 18, "bold")).pack(anchor="w")
+
+cam_box = tb.LabelFrame(header, text="Camera")
+cam_box.grid(row=0, column=1, sticky="e", padx=(12, 0))
+cam_label = tb.Label(cam_box, text="(starting...)")
+cam_label.pack(padx=6, pady=6)
+cam_status_var = tb.StringVar(value="Vision: starting...")
+tb.Label(cam_box, textvariable=cam_status_var, bootstyle="secondary").pack(padx=6, pady=(0, 6), anchor="w")
+
+status_var = tb.StringVar(value="Status: Starting...")
+tb.Label(root, textvariable=status_var, bootstyle="secondary").pack(padx=12, pady=4, anchor="w")
+
+readouts = tb.LabelFrame(root, text="Readouts")
+readouts.pack(padx=12, pady=8, fill="x")
+
+weight_var = tb.StringVar(value="-- g")
+category_var = tb.StringVar(value="—")
+fsr_var = tb.StringVar(value="--")
+
+tb.Label(readouts, text="Weight:", bootstyle="secondary").grid(row=0, column=0, padx=6, pady=6, sticky="w")
+tb.Label(readouts, textvariable=weight_var, font=("Arial", 12, "bold")).grid(row=0, column=1, padx=6, pady=6, sticky="w")
+
+tb.Label(readouts, text="Category:", bootstyle="secondary").grid(row=0, column=2, padx=6, pady=6, sticky="e")
+tb.Label(readouts, textvariable=category_var, font=("Arial", 12, "bold")).grid(row=0, column=3, padx=6, pady=6, sticky="w")
+
+tb.Label(readouts, text="FSR:", bootstyle="secondary").grid(row=1, column=0, padx=6, pady=6, sticky="w")
+tb.Label(readouts, textvariable=fsr_var, font=("Arial", 12, "bold")).grid(row=1, column=1, padx=6, pady=6, sticky="w")
+
+screens = tb.Frame(root)
+screens.pack(fill="both", expand=True, padx=12, pady=8)
+
+screen_home = tb.Frame(screens)
+tb.Label(screen_home, text="Choose a Mode", font=("Arial", 14, "bold")).pack(pady=16)
+tb.Button(screen_home, text="MANUAL MODE", bootstyle="info",
+          command=lambda: show_screen("manual")).pack(pady=10, ipadx=10, ipady=10, fill="x")
+tb.Button(screen_home, text="AUTOMATIC MODE", bootstyle="primary",
+          command=lambda: show_screen("auto")).pack(pady=10, ipadx=10, ipady=10, fill="x")
+
+screen_manual = tb.Frame(screens)
+top_bar_m = tb.Frame(screen_manual)
+top_bar_m.pack(fill="x", pady=6)
+tb.Button(top_bar_m, text="← Back", bootstyle="secondary",
+          command=lambda: show_screen("home")).pack(side="left")
+tb.Label(top_bar_m, text="Manual Mode", font=("Arial", 13, "bold")).pack(side="left", padx=10)
+
+manual_box = tb.LabelFrame(screen_manual, text="Manual Controls")
+manual_box.pack(fill="x", pady=10)
+
+xy = tb.LabelFrame(manual_box, text="XY Hold-to-Move")
+xy.pack(padx=10, pady=10, fill="x")
+
+btnN = tb.Button(xy, text="N", bootstyle="info")
+btnW = tb.Button(xy, text="W", bootstyle="info")
+btnE = tb.Button(xy, text="E", bootstyle="info")
+btnS = tb.Button(xy, text="S", bootstyle="info")
+
+btnN.grid(row=0, column=1, padx=6, pady=6, sticky="nsew")
+btnW.grid(row=1, column=0, padx=6, pady=6, sticky="nsew")
+btnE.grid(row=1, column=2, padx=6, pady=6, sticky="nsew")
+btnS.grid(row=2, column=1, padx=6, pady=6, sticky="nsew")
+
+for i in range(3):
+    xy.columnconfigure(i, weight=1)
+    xy.rowconfigure(i, weight=1)
+
+btnN.bind("<ButtonPress-1>",   lambda e: start_hold(0.0, -HOLD_STEP_Y))
+btnN.bind("<ButtonRelease-1>", lambda e: stop_hold())
+btnS.bind("<ButtonPress-1>",   lambda e: start_hold(0.0, +HOLD_STEP_Y))
+btnS.bind("<ButtonRelease-1>", lambda e: stop_hold())
+btnE.bind("<ButtonPress-1>",   lambda e: start_hold(+HOLD_STEP_X, 0.0))
+btnE.bind("<ButtonRelease-1>", lambda e: stop_hold())
+btnW.bind("<ButtonPress-1>",   lambda e: start_hold(-HOLD_STEP_X, 0.0))
+btnW.bind("<ButtonRelease-1>", lambda e: stop_hold())
+for b in (btnN, btnS, btnE, btnW):
+    b.bind("<Leave>", lambda e: stop_hold())
+
+z = tb.LabelFrame(manual_box, text="Z Pick + Claw")
+z.pack(padx=10, pady=10, fill="x")
+
+tb.Button(z, text="HOME", bootstyle="secondary", command=manual_home).pack(padx=10, pady=8, fill="x")
+tb.Button(z, text="RETRACT (HOLD)", bootstyle="info", command=manual_retract_hold).pack(padx=10, pady=6, fill="x")
+tb.Button(z, text="STOP RETRACT", bootstyle="danger", command=manual_stop_retract).pack(padx=10, pady=6, fill="x")
+tb.Button(z, text="DROP + CLOSE (FSR) + RETRACT", bootstyle="warning",
+          command=manual_drop_pick).pack(padx=10, pady=10, fill="x")
+tb.Button(z, text="RELEASE (OPEN CLAW)", bootstyle="danger",
+          command=manual_release_open).pack(padx=10, pady=6, fill="x")
+
+screen_auto = tb.Frame(screens)
+top_bar_a = tb.Frame(screen_auto)
+top_bar_a.pack(fill="x", pady=6)
+tb.Button(top_bar_a, text="← Back", bootstyle="secondary",
+          command=lambda: show_screen("home")).pack(side="left")
+tb.Label(top_bar_a, text="Automatic Mode", font=("Arial", 13, "bold")).pack(side="left", padx=10)
+
+auto_box = tb.LabelFrame(screen_auto, text="Automatic Controls")
+auto_box.pack(fill="x", pady=10)
+tb.Button(auto_box, text="START AUTO", bootstyle="success",
+          command=start_auto_cycle).pack(padx=10, pady=12, fill="x")
+tb.Button(auto_box, text="UNFREEZE WEIGHT", bootstyle="secondary",
+          command=unfreeze_weight).pack(padx=10, pady=6, fill="x")
+log_frame = tb.LabelFrame(root, text="Status Log")
+log_frame.pack(padx=12, pady=(0, 10), fill="x")
+log_box = tb.Text(log_frame, height=7)
+log_box.pack(padx=8, pady=8, fill="x")
+log_box.configure(state="disabled")
+
+def on_close():
+    stop_vision.set()
+    try:
+        if ser_gantry: ser_gantry.close()
+    except:
+        pass
+    try:
+        if ser_claw: ser_claw.close()
+    except:
+        pass
+    root.destroy()
+
+root.protocol("WM_DELETE_WINDOW", on_close)
+
+connect_serial()
+threading.Thread(target=serial_reader_loop, daemon=True).start()
+threading.Thread(target=vision_worker, daemon=True).start()
+update_camera_widget()
+ui_tick()
+show_screen("home")
+root.mainloop()
+
+
