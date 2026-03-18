@@ -1,0 +1,517 @@
+#include <Arduino.h>
+#include <math.h>
+#include <HX711_ADC.h>
+
+
+// Limit switches (active LOW, wired to GND when pressed)
+
+#define LIM_Y_BACK_PIN 4   // back/home
+#define LIM_Y_FWD_PIN  3   // forward max
+#define LIM_X_LEFT_PIN 8   // left/home
+
+static inline bool limPressed(uint8_t pin) {
+  return digitalRead(pin) == LOW;
+}
+
+#define X_RPWM_PIN 5 // x right movement
+#define X_LPWM_PIN 6 // x left movement
+#define Y_RPWM_PIN 10 // y right movement
+#define Y_LPWM_PIN 11 // y  left movement
+
+const uint8_t SPEED = 180;
+const unsigned long MS_PER_UNIT_X = 184;
+const unsigned long MS_PER_UNIT_Y = 175;
+
+// Travel limits (coordinates)
+
+const float X_MIN_UNITS = 0.0f;
+const float X_MAX_UNITS = 41.0f;
+const float Y_MIN_UNITS = 0.0f;
+const float Y_MAX_UNITS = 20.0f;
+
+
+// Position tracking
+
+float curX = 0.0f;
+float curY = 0.0f;
+bool isHomed = false;
+
+
+// Motor helpers
+
+void stopX(){ analogWrite(X_RPWM_PIN,0); analogWrite(X_LPWM_PIN,0); }
+void stopY(){ analogWrite(Y_RPWM_PIN,0); analogWrite(Y_LPWM_PIN,0); }
+void stopXY(){ stopX(); stopY(); }
+
+// X: +1 right, -1 left
+void driveX_dir(int dir){
+  if (dir > 0) { analogWrite(X_RPWM_PIN,0); analogWrite(X_LPWM_PIN,SPEED); }
+  else         { analogWrite(X_RPWM_PIN,SPEED); analogWrite(X_LPWM_PIN,0); }
+}
+
+// Y: +1 forward, -1 back
+void driveY_dir(int dir){
+  if (dir > 0) { analogWrite(Y_RPWM_PIN,SPEED); analogWrite(Y_LPWM_PIN,0); }
+  else         { analogWrite(Y_RPWM_PIN,0); analogWrite(Y_LPWM_PIN,SPEED); }
+}
+
+static inline float msToUnitsX(unsigned long ms){ return (float)ms / (float)MS_PER_UNIT_X; }
+static inline float msToUnitsY(unsigned long ms){ return (float)ms / (float)MS_PER_UNIT_Y; }
+
+static inline float clampf(float v, float lo, float hi) {
+  if (v < lo) return lo;
+  if (v > hi) return hi;
+  return v;
+}
+
+void reportPosLine(const char* tag) {
+  Serial.print(tag);
+  Serial.print(" X=");
+  Serial.print(curX, 2);
+  Serial.print(" Y=");
+  Serial.println(curY, 2);
+}
+
+
+// Z axis
+
+#define Z_PIN_A 12
+#define Z_PIN_B 13
+
+const unsigned long Z_DROP_MS    = 5000; // full top->bottom time
+const unsigned long Z_RETRACT_MS = 6700; // full bottom->top time
+const unsigned long DROP_SAFETY_MS    = 120;
+const unsigned long RETRACT_SAFETY_MS = 120;
+
+void zStop(){ digitalWrite(Z_PIN_A, LOW);  digitalWrite(Z_PIN_B, LOW);  }
+void zDown(){ digitalWrite(Z_PIN_A, LOW);  digitalWrite(Z_PIN_B, HIGH); }
+void zUp()  { digitalWrite(Z_PIN_A, HIGH); digitalWrite(Z_PIN_B, LOW);  }
+
+float zPos = 0.0f; // 0=TOP, 1=BOTTOM estimate
+float zPosStart = 0.0f;
+float zTargetPos = 0.0f;
+
+enum ZState { Z_IDLE, Z_MOVING_UP, Z_MOVING_DOWN };
+ZState zState = Z_IDLE;
+
+unsigned long zMoveStartMs = 0;
+unsigned long zMoveDurMs = 0;
+
+bool zHoldUp = false;
+bool zHoldDown = false;
+
+void zBeginMoveTo(float tgt) {
+  // Cancel hold mode if a timed move begins
+  zHoldUp = false;
+  zHoldDown = false;
+
+  tgt = clampf(tgt, 0.0f, 1.0f);
+  zTargetPos = tgt;
+
+  if (fabs(zTargetPos - zPos) < 0.001f) { zStop(); zState = Z_IDLE; return; }
+
+  zPosStart = zPos;
+  zMoveStartMs = millis();
+
+  if (zTargetPos > zPos) {
+    float delta = zTargetPos - zPos;
+    unsigned long full = (Z_DROP_MS > DROP_SAFETY_MS) ? (Z_DROP_MS - DROP_SAFETY_MS) : Z_DROP_MS;
+    zMoveDurMs = (unsigned long)(delta * (float)full);
+    zDown();
+    zState = Z_MOVING_DOWN;
+  } else {
+    float delta = zPos - zTargetPos;
+    unsigned long full = (Z_RETRACT_MS > RETRACT_SAFETY_MS) ? (Z_RETRACT_MS - RETRACT_SAFETY_MS) : Z_RETRACT_MS;
+    zMoveDurMs = (unsigned long)(delta * (float)full);
+    zUp();
+    zState = Z_MOVING_UP;
+  }
+  if (zMoveDurMs < 20) zMoveDurMs = 20;
+}
+
+void zUpdate() {
+  if (zState == Z_IDLE) return;
+
+  unsigned long elapsed = millis() - zMoveStartMs;
+
+  if (elapsed >= zMoveDurMs) {
+    zPos = clampf(zTargetPos, 0.0f, 1.0f);
+    zStop();
+    zState = Z_IDLE;
+
+    if (zPos <= 0.01f) Serial.println("Z_AT_TOP");
+    else if (zPos >= 0.99f) Serial.println("Z_AT_BOTTOM");
+    else { Serial.print("Z_AT zPos="); Serial.println(zPos, 3); }
+    return;
+  }
+
+  float frac = clampf((float)elapsed / (float)zMoveDurMs, 0.0f, 1.0f);
+  zPos = clampf(zPosStart + (zTargetPos - zPosStart) * frac, 0.0f, 1.0f);
+}
+
+// Load cell (HX711)
+
+const int HX711_dout = 9;
+const int HX711_sck  = 7;
+
+HX711_ADC LoadCell(HX711_dout, HX711_sck);
+static float calibrationValue = 360.32f;
+
+bool weightStream = true;
+unsigned long lastWms = 0;
+const unsigned long W_PERIOD_MS = 200; // 5 Hz
+
+// Load Cell Filtering + Auto-Tare
+const int NUM_SAMPLES = 10;
+const float EMPTY_THRESHOLD = 5.0; // grams considered empty
+const float ZERO_CLAMP = 2.0;      // clamp tiny noise
+float tareOffset = 0.0;
+
+void loadcellInit() {
+  LoadCell.begin();
+  unsigned long stabilizingtime = 2000;
+  boolean _tare = true;
+
+  LoadCell.start(stabilizingtime, _tare);
+
+  if (LoadCell.getTareTimeoutFlag()) {
+    Serial.println("ERR HX711_TARE_TIMEOUT");
+  } else {
+    LoadCell.setCalFactor(calibrationValue);
+    Serial.println("LOADCELL_READY");
+  }
+}
+
+void loadcellUpdate() {
+  LoadCell.update();
+
+  if (weightStream && (millis() - lastWms) >= W_PERIOD_MS) {
+    float total = 0;
+
+    for (int i = 0; i < NUM_SAMPLES; i++) {
+      LoadCell.update();
+      total += LoadCell.getData();
+    }
+
+    float weight = total / NUM_SAMPLES;
+
+    // Auto-tare when empty
+    if (fabs(weight) < EMPTY_THRESHOLD) {
+      tareOffset = weight;
+    }
+
+    float corrected = weight - tareOffset;
+
+    // Clamp small noise
+    if (fabs(corrected) < ZERO_CLAMP) {
+      corrected = 0.0;
+    }
+
+    Serial.print("W=");
+    Serial.println(corrected, 2);
+
+    lastWms = millis();
+  }
+}
+
+
+// Motor movement (with limit swithces)
+
+unsigned long runX_ms_guarded(int dir, unsigned long durMs) {
+  unsigned long t0 = millis();
+  driveX_dir(dir);
+
+  while (millis() - t0 < durMs) {
+    loadcellUpdate();
+
+    // left limit switch for homing
+    if (dir < 0 && limPressed(LIM_X_LEFT_PIN)) break;
+
+    delay(1);
+  }
+  stopX();
+  return millis() - t0;
+}
+
+unsigned long runY_ms_guarded(int dir, unsigned long durMs) {
+  unsigned long t0 = millis();
+  driveY_dir(dir);
+
+  while (millis() - t0 < durMs) {
+    loadcellUpdate();
+
+    if (dir < 0 && limPressed(LIM_Y_BACK_PIN)) break;
+    if (dir > 0 && limPressed(LIM_Y_FWD_PIN)) break;
+
+    delay(1);
+  }
+  stopY();
+  return millis() - t0;
+}
+
+// When target y is exactly Y_MAX, hit the forward switch to guarantee alignment
+void snapToYForwardSwitch() {
+  if (limPressed(LIM_Y_FWD_PIN)) return;
+
+  const unsigned long MAX_BUMP_MS = 2500;
+  unsigned long t0 = millis();
+  driveY_dir(+1);
+
+  while (!limPressed(LIM_Y_FWD_PIN) && (millis() - t0) < MAX_BUMP_MS) {
+    loadcellUpdate();
+    delay(1);
+  }
+  stopY();
+
+  if (limPressed(LIM_Y_FWD_PIN)) {
+    curY = Y_MAX_UNITS;
+    Serial.println("Y_FWD_HIT");
+  } else {
+    Serial.println("WARN Y_FWD_NOT_HIT");
+  }
+}
+
+
+// Homing
+
+void doHome() {
+  if (zState != Z_IDLE) { Serial.println("ERR Z_BUSY"); return; }
+
+  // If in hold mode, cancel it
+  zHoldUp = false;
+  zHoldDown = false;
+  zStop();
+
+  stopXY();
+
+  // X left
+  driveX_dir(-1);
+  while (!limPressed(LIM_X_LEFT_PIN)) { loadcellUpdate(); delay(1); }
+  stopX();
+
+  // Y back
+  driveY_dir(-1);
+  while (!limPressed(LIM_Y_BACK_PIN)) { loadcellUpdate(); delay(1); }
+  stopY();
+
+  curX = 0.0f;
+  curY = 0.0f;
+  isHomed = true;
+  Serial.println("HOMED");
+}
+
+
+// MOVE PRIMITIVES
+
+void moveRelative(float dx, float dy) {
+  if (!isHomed) { Serial.println("ERR NOT_HOMED"); return; }
+  if (zState != Z_IDLE) { Serial.println("ERR Z_BUSY"); return; }
+  if (zHoldUp || zHoldDown) { Serial.println("ERR Z_HOLD_ACTIVE"); return; }
+
+  float tgtX = curX + dx;
+  float tgtY = curY + dy;
+
+  // clamp deltas so we stay within limits
+  if (tgtX < X_MIN_UNITS) dx = X_MIN_UNITS - curX;
+  if (tgtX > X_MAX_UNITS) dx = X_MAX_UNITS - curX;
+  if (tgtY < Y_MIN_UNITS) dy = Y_MIN_UNITS - curY;
+  if (tgtY > Y_MAX_UNITS) dy = Y_MAX_UNITS - curY;
+
+  // X move
+  if (dx != 0.0f) {
+    int dir = (dx > 0) ? +1 : -1;
+    unsigned long dur = (unsigned long)(fabsf(dx) * (float)MS_PER_UNIT_X);
+    unsigned long ran = runX_ms_guarded(dir, dur);
+    float moved = msToUnitsX(ran);
+
+    curX = (dir > 0) ? (curX + moved) : (curX - moved);
+    curX = clampf(curX, X_MIN_UNITS, X_MAX_UNITS);
+
+    if (dir < 0 && limPressed(LIM_X_LEFT_PIN)) curX = X_MIN_UNITS;
+  }
+
+  // Y move
+  bool goingToYMax = (fabsf((curY + dy) - Y_MAX_UNITS) < 0.001f);
+
+  if (dy != 0.0f) {
+    int dir = (dy > 0) ? +1 : -1;
+    unsigned long dur = (unsigned long)(fabsf(dy) * (float)MS_PER_UNIT_Y);
+    unsigned long ran = runY_ms_guarded(dir, dur);
+    float moved = msToUnitsY(ran);
+
+    curY = (dir > 0) ? (curY + moved) : (curY - moved);
+    curY = clampf(curY, Y_MIN_UNITS, Y_MAX_UNITS);
+
+    if (dir < 0 && limPressed(LIM_Y_BACK_PIN)) curY = Y_MIN_UNITS;
+    if (dir > 0 && limPressed(LIM_Y_FWD_PIN)) curY = Y_MAX_UNITS;
+  }
+
+  if (goingToYMax) snapToYForwardSwitch();
+
+  Serial.println("AT");
+  reportPosLine("POS");
+}
+
+void moveAbsolute(float x, float y) {
+  if (!isHomed) { Serial.println("ERR NOT_HOMED"); return; }
+  if (zState != Z_IDLE) { Serial.println("ERR Z_BUSY"); return; }
+  if (zHoldUp || zHoldDown) { Serial.println("ERR Z_HOLD_ACTIVE"); return; }
+
+  x = clampf(x, X_MIN_UNITS, X_MAX_UNITS);
+  y = clampf(y, Y_MIN_UNITS, Y_MAX_UNITS);
+  moveRelative(x - curX, y - curY);
+}
+
+
+// COMMAND PARSING
+
+String line;
+
+bool parseTwoFloats(const String& s, float &a, float &b) {
+  int sp1 = s.indexOf(' ');
+  if (sp1 < 0) return false;
+  int sp2 = s.indexOf(' ', sp1 + 1);
+  if (sp2 < 0) return false;
+
+  String as = s.substring(sp1 + 1, sp2);
+  String bs = s.substring(sp2 + 1);
+
+  as.trim(); bs.trim();
+  if (!as.length() || !bs.length()) return false;
+
+  a = as.toFloat();
+  b = bs.toFloat();
+  return true;
+}
+
+
+// Setup
+
+void setup() {
+  Serial.begin(115200);
+  delay(250);
+
+  // motor pins
+  pinMode(X_RPWM_PIN, OUTPUT); pinMode(X_LPWM_PIN, OUTPUT);
+  pinMode(Y_RPWM_PIN, OUTPUT); pinMode(Y_LPWM_PIN, OUTPUT);
+  stopXY();
+
+  // limit switches
+  pinMode(LIM_Y_BACK_PIN, INPUT_PULLUP);
+  pinMode(LIM_Y_FWD_PIN,  INPUT_PULLUP);
+  pinMode(LIM_X_LEFT_PIN, INPUT_PULLUP);
+
+  // Z pins
+  pinMode(Z_PIN_A, OUTPUT);
+  pinMode(Z_PIN_B, OUTPUT);
+  zStop();
+
+  // load cell
+  loadcellInit();
+
+  Serial.println("READY_GANTRY_Z_LOADCELL");
+  Serial.println("INFO cmds: HOME | GOTOABS x y | MOVE dx dy | POS? | ZTOP | ZBOTTOM | ZSTOP | ZUP_HOLD | ZDOWN_HOLD | WON | WOFF");
+}
+
+void loop() {
+  // keep running always
+  loadcellUpdate();
+
+  // NEW: Hold mode overrides timed zUpdate()
+  if (zHoldUp) {
+    zUp();
+  } else if (zHoldDown) {
+    zDown();
+  } else {
+    zUpdate();
+  }
+
+  if (!Serial.available()) return;
+
+  line = Serial.readStringUntil('\n');
+  line.trim();
+  if (!line.length()) return;
+
+  // POS?
+  if (line == "POS?") {
+    Serial.print("POS X=");
+    Serial.print(curX, 2);
+    Serial.print(" Y=");
+    Serial.println(curY, 2);
+    return;
+  }
+
+  // HOME
+  if (line == "HOME") {
+    doHome();
+    return;
+  }
+
+  // GOTOABS x y
+  if (line.startsWith("GOTOABS")) {
+    float x, y;
+    if (!parseTwoFloats(line, x, y)) { Serial.println("ERR BAD_GOTOABS"); return; }
+    moveAbsolute(x, y);
+    return;
+  }
+
+  // MOVE dx dy (relative)
+  if (line.startsWith("MOVE")) {
+    float dx, dy;
+    if (!parseTwoFloats(line, dx, dy)) { Serial.println("ERR BAD_MOVE"); return; }
+    moveRelative(dx, dy);
+    return;
+  }
+
+
+  // Retract
+
+  if (line == "ZUP_HOLD") {
+    // cancel any timed move and force continuous UP
+    zState = Z_IDLE;
+    zHoldDown = false;
+    zHoldUp = true;
+    zUp();
+    Serial.println("Z_UP_HOLDING");
+    return;
+  }
+
+  if (line == "ZDOWN_HOLD") {
+    zState = Z_IDLE;
+    zHoldUp = false;
+    zHoldDown = true;
+    zDown();
+    Serial.println("Z_DOWN_HOLDING");
+    return;
+  }
+
+  // Z timed commands
+  if (line == "ZTOP") {
+    if (zState != Z_IDLE) { Serial.println("ERR Z_BUSY"); return; }
+    zBeginMoveTo(0.0f);
+    return;
+  }
+  if (line == "ZBOTTOM") {
+    if (zState != Z_IDLE) { Serial.println("ERR Z_BUSY"); return; }
+    zBeginMoveTo(1.0f);
+    return;
+  }
+
+  // ZSTOP (IMMEDIATE stop + cancels hold)
+  if (line == "ZSTOP") {
+    zHoldUp = false;
+    zHoldDown = false;
+    zStop();
+    zState = Z_IDLE;
+    Serial.print("Z_STOP zPos=");
+    Serial.println(zPos, 3);
+    return;
+  }
+
+  // Weight stream toggle
+  if (line == "WON")  { weightStream = true;  Serial.println("W_STREAM_ON");  return; }
+  if (line == "WOFF") { weightStream = false; Serial.println("W_STREAM_OFF"); return; }
+
+  Serial.println("ERR UNKNOWN");
+}
+
